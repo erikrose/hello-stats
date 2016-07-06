@@ -20,7 +20,9 @@ Idealized state sequences for the 2 different types of clients::
 
     Link-clicker:
         action = join (status / refresh)+ leave
-        state = waiting starting receiving sending? sendrecv  # These can come out of order due to varying latencies in transports.
+        state = waiting starting receiving sending? sendrecv  # These can come out
+                                                              # of order due to varying
+                                                              # latencies in transports.
 
     Iff action=status, there's a state.
 
@@ -34,7 +36,8 @@ from os.path import dirname, join
 from pyelasticsearch import ElasticSearch, ElasticHttpNotFoundError
 
 from hello_stats.events import BEGINNING_OF_TIME, EVENT_CLASSES_WORST_FIRST, events_from_day
-from hello_stats.sessions import World
+from hello_stats.events import Connected, Success, SendRecv
+from hello_stats.sessions import World, Room
 from hello_stats.storage import VERSION, PickleBucket, VersionedJsonBucket
 import argparse
 
@@ -42,21 +45,37 @@ import argparse
 class StateCounter(object):
     """A histogram of link-clicker states"""
 
-    def __init__(self, buckets=()):
+    def __init__(self, buckets=(), sort=False):
         """If you want a bucket to be guaranteed to show up, pass it in as one
-        of ``buckets``. Otherwise, I'll make them dynamically."""
+        of ``buckets``. Otherwise, I'll make them dynamically.
+
+        If sort is false, the order of the buckets will be used.
+        """
         self.total = 0
         self.d = OrderedDict((b, 0) for b in buckets)
+        self.sort = sort
 
     def incr(self, state):
         self.d[state] = self.d.get(state, 0) + 1
         self.total += 1
 
+    def add(self, otherCounter):
+        """Adds another counter's totals into this counter."""
+        for k, e in otherCounter.d.items():
+            self.d[k] = self.d.get(k, 0) + e
+            self.total += e
+
     def histogram(self, stars=100):
         """Return an ASCII-art bar chart for debugging and exploration."""
         ret = []
         STARS = 100
-        for state, count in self.d.iteritems():
+
+        if self.sort:
+            items = sorted(self.d.iteritems())
+        else:
+            items = self.d.iteritems()
+
+        for state, count in items:
             ret.append('{state: >9} {bar} {count}'.format(
                 state=state,
                 bar='*' * (STARS * count / (self.total or 1)),
@@ -75,6 +94,109 @@ class StateCounter(object):
         return self.total != 0
 
 
+class DayConnectionTimesSummary(object):
+    """Builds a connection time summary based on supplied times."""
+    def __init__(self):
+        self.clickerAvTime = []
+        self.clickerScreenTime = []
+        self.builtInAvTime = []
+        self.exceptionNumbers = StateCounter(sort=True)
+        self.exceptionTimes = []
+
+    def append(self, clickerAvTime, clickerScreenTime, builtInAvTime):
+        self.clickerAvTime.append(clickerAvTime)
+        self.clickerScreenTime.append(clickerScreenTime)
+        self.builtInAvTime.append(builtInAvTime)
+
+    def appendException(self, exceptionNumber, exceptionTime):
+        self.exceptionNumbers.incr(exceptionNumber)
+        self.exceptionTimes.append(exceptionTime)
+
+    def generate_counter(self, times):
+        counter = StateCounter(sort=True)
+
+        for time in times:
+            counter.incr(time)
+
+        return counter
+
+    def print_summary(self):
+        print "Clicker A/V Connection Times:"
+        print self.generate_counter(self.clickerAvTime)
+
+        print "Clicker Screen Connection Times:"
+        print self.generate_counter(self.clickerScreenTime)
+
+        print "Built-in A/V Connection Times:"
+        print self.generate_counter(self.builtInAvTime)
+
+        print "First exception numbers:"
+        print self.exceptionNumbers
+
+        print "Exception Times (link-clicker & built-in):"
+        print self.generate_counter(self.exceptionTimes)
+
+
+class PeriodConnectionTimesSummary(object):
+    """Builds a connection time summary based over multiple days by summing
+       results from DayConnectionTimesSummary.
+    """
+    def __init__(self):
+        self.clickerAvTime = []
+        self.clickerScreenTime = []
+        self.builtInAvTime = []
+        self.exceptionNumbers = StateCounter(sort=True)
+        self.exceptionTimes = []
+
+    def append(self, dayTimesSummary):
+        self.clickerAvTime += dayTimesSummary.clickerAvTime
+        self.clickerScreenTime += dayTimesSummary.clickerScreenTime
+        self.builtInAvTime += dayTimesSummary.builtInAvTime
+        self.exceptionNumbers.add(dayTimesSummary.exceptionNumbers)
+        self.exceptionTimes += dayTimesSummary.exceptionTimes
+
+    def generate_counter(self, times):
+        counter = StateCounter(sort=True)
+
+        for time in times:
+            counter.incr(time)
+
+        return counter
+
+    def print_stats(self, times):
+        # Get rid of "zero times", we couldn't determine anything.
+        noZerosTimes = [t for t in times if t > 0 and t < 35]
+
+        count = len(noZerosTimes)
+        if not count:
+            print "No values available"
+            return
+
+        print "Total Points: %d" % len(noZerosTimes)
+        print "Min         : %d" % min(noZerosTimes)
+        print "Average     : %.2f" % (sum(noZerosTimes) / float(count))
+        print "Max         : %d" % max(noZerosTimes)
+
+        print self.generate_counter(noZerosTimes)
+
+    def print_summary(self):
+        print "Clicker A/V Connection Metrics"
+        print "------------------------------"
+        self.print_stats(self.clickerAvTime)
+        print "Clicker Screen Connection Metrics"
+        print "---------------------------------"
+        self.print_stats(self.clickerScreenTime)
+        print "Built-in A/V Connection Metrics"
+        print "-------------------------------"
+        self.print_stats(self.builtInAvTime)
+        print "First Exception Numbers"
+        print "-----------------------"
+        print self.exceptionNumbers
+        print "Times to first exception (link-clicker & built-in, timed from streamCreated event)"
+        print "----------------------------------------------------------------------------------"
+        self.print_stats(self.exceptionTimes)
+
+
 def days_between(start, end):
     """Yield each datetime.date in the interval [start, end)."""
     while start < end:
@@ -86,16 +208,31 @@ def counts_for_day(segments):
     """Return a StateCounter conveying a histogram of the segments' furthest
     states."""
     counter = StateCounter(c.name() for c in EVENT_CLASSES_WORST_FIRST)
+    dayCounter = DayConnectionTimesSummary()
+
     for segment in segments:
         furthest = segment.furthest_state()
         counter.incr(furthest.name())
-    return counter
+        # Additional logging to work out if the connection times if we connected
+        # successfully.
+        if furthest is Connected or furthest is Success:
+            clickerAvTime, clickerScreenTime, builtInAvTime = segment.get_connection_time_integer()
+            dayCounter.append(clickerAvTime, clickerScreenTime, builtInAvTime)
+
+        # Additional logging to work out the time to the first exception, if the
+        # segment didn't connect successfully.
+        if furthest is SendRecv and segment.exception():
+            exceptionTime = segment.get_exception_time_integer()
+            dayCounter.appendException(segment.exception(), exceptionTime)
+
+    return counter, dayCounter
 
 
 def success_duration_histogram(segments):
     """Return an iterable of lengths of time it takes to get from tryst to
     sendrecv."""
-    # Answer: 90% in <7s, 99% in <23s, from running against most of 8/13/2015. I guess I want to see if the failures are more slanted toward short intervals than this histogram.
+    # Answer: 90% in <7s, 99% in <23s, from running against most of 8/13/2015.
+    # I guess I want to see if the failures are more slanted toward short intervals than this histogram.
     for segment in segments:
         room = Room()
         start = None
@@ -122,7 +259,10 @@ def failure_duration_histogram(segments):
     connection.
 
     """
-    # A full 52% of these come out as 0. That suggests a lot failures could be due to having insufficient time for negotiation (though, of course, it really means "at least 0", not exactly 0, so take that into account. Next, it would be nice to get actual numbers for this, not just "at least" ones.
+    # A full 52% of these come out as 0. That suggests a lot failures could be due
+    # to having insufficient time for negotiation (though, of course, it really
+    # means "at least 0", not exactly 0, so take that into account. Next, it
+    # would be nice to get actual numbers for this, not just "at least" ones.
     for segment in segments:
         room = Room()
         start = None
@@ -147,11 +287,11 @@ def update_metrics(es, version, metrics, world, beginning_of_time):
 
     """
     today = date.today()
-    yesterday = today - timedelta(days=1)
 
     if not metrics or VERSION > version:  # need to start over
         start_at = beginning_of_time
         metrics = []
+        periodTimesSummary = PeriodConnectionTimesSummary()
         world = World()
     else:
         # Figure out which days we missed, as of the end of the stored JSON.
@@ -166,17 +306,22 @@ def update_metrics(es, version, metrics, world, beginning_of_time):
 
         try:
             segments = world.do(events_from_day(iso_day, es))
-            counts = counts_for_day(segments)
+            counts, dayCounter = counts_for_day(segments)
         except ElasticHttpNotFoundError:
             print 'Index not found. Proceeding to next day.'
             continue
         print counts
         print "%s sessions span midnight (%s%%)." % (len(world._rooms), len(world._rooms) / float(counts.total) * 100)
+
+        dayCounter.print_summary()
+
         a_days_metrics = counts.as_dict()
         a_days_metrics['date'] = iso_day
         metrics.append(a_days_metrics)
 
-    return metrics, world
+        periodTimesSummary.append(dayCounter)
+
+    return metrics, world, periodTimesSummary
 
 
 def valid_date(s):
@@ -237,12 +382,15 @@ def main():
             world = None
             metrics = []
 
-    metrics, world = update_metrics(es, version, metrics, world, args.beginning_of_time)
+    metrics, world, periodTimesSummary = \
+        update_metrics(es, version, metrics, world, args.beginning_of_time)
 
     if not args.no_publish:
         # Write back to the buckets:
         world_bucket.write(world)
         metrics_bucket.write(metrics)
+
+    periodTimesSummary.print_summary()
 
 
 if __name__ == '__main__':

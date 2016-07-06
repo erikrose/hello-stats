@@ -51,13 +51,28 @@ def events_from_day(iso_day, es, size=1000000):
         'size': size,  # TODO: Slice nicely. As is, we get only 100K hits in a day, so YAGNI.
         '_source': {'include': ['action', 'token', 'userType', 'state',
                                 'Timestamp', 'user_agent_browser',
-                                'user_agent_version', 'event']}
+                                'user_agent_version', 'event', 'loopAddonVersion']}
     },
     index='loop-app-logs-%s' % iso_day,
     doc_type='request.summary')['hits']['hits']
 
     for hit in hits:
         source = hit['_source']
+
+        # Specially handle the subscribeCompleted event as it didn't get its own state.
+        # XXX Ideally we should also handle the expected Session.screen.subscribeCompleted
+        # as well, but that requires additional handling of the "Connected" flag.
+        if source.get('event') == "Session.subscribeCompleted":
+            yield Connected(
+                token=source['token'],
+                is_clicker=source['userType'] == 'Link-clicker',  # TODO: Make sure there's nothing invalid in this field.
+                timestamp=decode_es_datetime(source['Timestamp']),
+                browser=source.get('user_agent_browser', ''),
+                version=source.get('user_agent_version', 0),
+                addon_version=source.get('loopAddonVersion'),
+                event=source.get('event') or '')
+            continue
+
         action_and_state = source.get('action'), source.get('state')
         try:
             class_ = EVENT_CLASSES_BY_ACTION_AND_STATE[action_and_state]
@@ -70,6 +85,7 @@ def events_from_day(iso_day, es, size=1000000):
             timestamp=decode_es_datetime(source['Timestamp']),
             browser=source.get('user_agent_browser', ''),
             version=source.get('user_agent_version', 0),
+            addon_version=source.get('loopAddonVersion'),
             event=source.get('event') or '')
 
 
@@ -78,13 +94,16 @@ class Event(object):
     # progression through the room states, culminating in sendrecv. Everything
     # is pretty arbitrary except that SendRecv has the max.
 
-    def __init__(self, token, is_clicker, timestamp, browser=None, version=None, event=''):
+    def __init__(self, token, is_clicker, timestamp, browser=None, version=None, addon_version=None, event=''):
         self.token = token
         self.is_clicker = is_clicker
         self.timestamp = timestamp
         self.browser = browser
         self.version = version if version else None  # int or None, never 0
+        self.addon_version = addon_version
         self.exception = self._exception_from_event(event)  # int or None
+        # event is the event text, e.g. "Session.streamCreated"
+        self.event = event
 
     def _exception_from_event(self, event):
         match = re.match(r'sdk\.exception\.(\d+)', event)
@@ -172,11 +191,15 @@ class Sending(Event):
 
 
 class SendRecv(Event):
-    progression = 4  # must be the max
+    progression = 4
+
+
+class Connected(Event):
+    progression = 5  # must be the max
 
 
 class Success(object):
-    """Fake state used to represent getting to SendRecv without an exception"""
+    """Fake state used to represent getting to Connected without an exception"""
 
     @classmethod
     def name(cls):
@@ -191,7 +214,9 @@ EVENT_CLASSES_BY_ACTION_AND_STATE = {
     ('status', 'starting'): Starting,
     ('status', 'receiving'): Receiving,
     ('status', 'sending'): Sending,
-    ('status', 'sendrecv'): SendRecv
+    ('status', 'sendrecv'): SendRecv,
+    # This doesn't match, but it does give us the progression that we need.
+    ('status', None, 'Session.subscribeCompleted'): Connected
 }
 EVENT_CLASSES_WORST_FIRST = sorted(
     EVENT_CLASSES_BY_ACTION_AND_STATE.itervalues(),
