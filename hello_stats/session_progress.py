@@ -277,7 +277,7 @@ def failure_duration_histogram(segments):
             yield "Inconceivable!"
 
 
-def update_metrics(es, version, metrics, world, beginning_of_time):
+def update_metrics(es, version, metrics, world, beginning_of_time, end_of_time):
     """Update metrics with today's (and previous missed days') data.
 
     Also update the state of the ``world`` with sessions that may hang over
@@ -286,7 +286,7 @@ def update_metrics(es, version, metrics, world, beginning_of_time):
     If VERSION has increased or ``metrics`` is empty, start over.
 
     """
-    today = date.today()
+    today = end_of_time
 
     if not metrics or VERSION > version:  # need to start over
         start_at = beginning_of_time
@@ -298,6 +298,8 @@ def update_metrics(es, version, metrics, world, beginning_of_time):
         # (This tolerates unreliable cron jobs, which Heroku warns of, and
         # also guards against other transient failures.)
         start_at = datetime.strptime(metrics[-1]['date'], '%Y-%m-%d').date() + timedelta(days=1)
+
+    firstDay = True
 
     # Add each of those to the bucket:
     for day in days_between(start_at, today):
@@ -319,7 +321,11 @@ def update_metrics(es, version, metrics, world, beginning_of_time):
         a_days_metrics['date'] = iso_day
         metrics.append(a_days_metrics)
 
-        periodTimesSummary.append(dayCounter)
+        # Skip the first day of metrics as this may be wrong due to midnight sessions.
+        if firstDay:
+            firstDay = False
+        else:
+            periodTimesSummary.append(dayCounter)
 
     return metrics, world, periodTimesSummary
 
@@ -338,6 +344,12 @@ def main():
                         default=BEGINNING_OF_TIME,
                         type=valid_date,
                         help="The start date for the beginning of metrics processing, "
+                        "currently %s. Format YYYY-MM-DD" % BEGINNING_OF_TIME.isoformat())
+    parser.add_argument("-e", "--end-of-time",
+                        default=date.today(),
+                        type=valid_date,
+                        help="The end date for the beginning of metrics processing, "
+                        "it will effectively finish the date before, "
                         "currently %s. Format YYYY-MM-DD" % BEGINNING_OF_TIME.isoformat())
     parser.add_argument("--no-publish",
                         default=False,
@@ -383,7 +395,8 @@ def main():
             metrics = []
 
     metrics, world, periodTimesSummary = \
-        update_metrics(es, version, metrics, world, args.beginning_of_time)
+        update_metrics(es, version, metrics, world, args.beginning_of_time,
+                       args.end_of_time)
 
     if not args.no_publish:
         # Write back to the buckets:
