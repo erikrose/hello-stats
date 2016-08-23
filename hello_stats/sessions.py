@@ -234,6 +234,16 @@ class Segment(object):
         if furthest is expectedFurthest and not any(e.exception for e in self):
             furthest = Success
 
+        if furthest != Success:
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "Expected: %s, Actual Furthest: %s" % (expectedFurthest, furthest)
+            for event in self._events:
+                print event
+
         return furthest
 
     def is_failure(self):

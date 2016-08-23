@@ -59,6 +59,13 @@ def events_from_day(iso_day, es, size=1000000):
     for hit in hits:
         source = hit['_source']
 
+        # Uncomment this to test with just add-ons post 1.4.3
+        # (that had the timeout fixes).
+        # if source['userType'] != 'Link-clicker' and \
+        #   not (source.get('loopAddonVersion') == '1.4.3' or
+        #        source.get('loopAddonVersion') == '1.4.4'):
+        #    continue
+
         # Specially handle the subscribeCompleted event as it didn't get its own state.
         # XXX Ideally we should also handle the expected Session.screen.subscribeCompleted
         # as well, but that requires additional handling of the "Connected" flag.

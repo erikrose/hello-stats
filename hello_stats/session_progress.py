@@ -288,10 +288,12 @@ def update_metrics(es, version, metrics, world, beginning_of_time, end_of_time):
     """
     today = end_of_time
 
+    periodTimesSummary = PeriodConnectionTimesSummary()
+    countsSummary = StateCounter(c.name() for c in EVENT_CLASSES_WORST_FIRST)
+
     if not metrics or VERSION > version:  # need to start over
         start_at = beginning_of_time
         metrics = []
-        periodTimesSummary = PeriodConnectionTimesSummary()
         world = World()
     else:
         # Figure out which days we missed, as of the end of the stored JSON.
@@ -313,6 +315,7 @@ def update_metrics(es, version, metrics, world, beginning_of_time, end_of_time):
             print 'Index not found. Proceeding to next day.'
             continue
         print counts
+        countsSummary.add(counts)
         print "%s sessions span midnight (%s%%)." % (len(world._rooms), len(world._rooms) / float(counts.total) * 100)
 
         dayCounter.print_summary()
@@ -327,7 +330,7 @@ def update_metrics(es, version, metrics, world, beginning_of_time, end_of_time):
         else:
             periodTimesSummary.append(dayCounter)
 
-    return metrics, world, periodTimesSummary
+    return metrics, world, periodTimesSummary, countsSummary
 
 
 def valid_date(s):
@@ -394,7 +397,7 @@ def main():
             world = None
             metrics = []
 
-    metrics, world, periodTimesSummary = \
+    metrics, world, periodTimesSummary, countsSummary = \
         update_metrics(es, version, metrics, world, args.beginning_of_time,
                        args.end_of_time)
 
@@ -403,6 +406,10 @@ def main():
         world_bucket.write(world)
         metrics_bucket.write(metrics)
 
+    print "Summaries"
+    print "---------"
+    print "---------"
+    print countsSummary
     periodTimesSummary.print_summary()
 
 
