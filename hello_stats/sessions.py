@@ -1,10 +1,16 @@
 """State machines that eat Events"""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import groupby
 from pprint import pformat
+import re
 
-from hello_stats.events import PROGRESSION_TO_EVENT_CLASS, Leave, SendRecv, Success, Timeout, TIMEOUT_DURATION
+from hello_stats.events import PROGRESSION_TO_EVENT_CLASS, Leave, Connected, SendRecv, Success, Timeout, \
+    TIMEOUT_DURATION
+
+# This is the date the standalone was deployed with the additional sessionCompleted
+# information.
+LOOP_STANDALONE_CONNECTED_DEPLOYMENT_DATE = datetime(2016, 07, 05)
 
 
 class Segment(object):
@@ -37,6 +43,7 @@ class Segment(object):
         """
         self._built_in_states = built_in.states_reached.copy()
         self._min_firefox_version = built_in.min_firefox_version
+        self._built_in_addon_version = built_in.addon_version
         self._clicker_states = clicker.states_reached.copy()
         return self
 
@@ -49,6 +56,127 @@ class Segment(object):
     def __str__(self):
         return pformat(self._events)
 
+    def get_earliest(self, previous, new):
+        if previous is None or new.timestamp < previous.timestamp:
+            return new
+
+        return previous
+
+    def get_latest(self, previous, new):
+        if previous is None or new.timestamp > previous.timestamp:
+            return new
+
+        return previous
+
+    def get_time_delta(self, first, last):
+        """Returns the time delta between two events in seconds."""
+
+        # Filter out any zeros, e.g. broken segments or ones where we simply
+        # didn't generate the last event.
+        if first is None or last is None:
+            return 0
+
+        # Note: the timestamps in the logs are integers.
+        return int((last.timestamp - first.timestamp).total_seconds())
+
+    def get_connection_time_integer(self):
+        """Returns the amount of time it took to connect for various types of
+        connection.
+
+        For both link clicker and built-in (add-on): The time from when the
+        OpenTok SDK notified an a/v stream was created (Session.streamCreated/
+        Session.av.streamCreated), to when the SDK provided a media stream
+        (Session.subscribeCompleted).
+
+        For just the link clicker: The time from when the
+        OpenTok SDK notified a screen sharing stream was created
+        (Session.screen.streamCreated), to when the SDK provided a media stream
+        (Session.screen.subscribeCompleted).
+        """
+
+        # Find the earliest streamCreated event (we assume that was A/V),
+        # and the time of the subscribeCompleted.
+        clicker = {
+            "is_clicker": True,
+            "avCreated": None,
+            "latestOldCreated": None,
+            "avSubscribeCompleted": None,
+            "screenCreated": None,
+            "screenSubscribeCompleted": None
+        }
+        built_in = {
+            "is_clicker": False,
+            "avCreated": None,
+            "avSubscribeCompleted": None
+        }
+        for event in self._events:
+            if event.is_clicker:
+                # Earlier versions had just Session.streamCreated.
+                # Session.av.streamCreated is the newer version.
+                if event.event == "Session.streamCreated" or \
+                   event.event == "Session.av.streamCreated":
+                    clicker["avCreated"] = self.get_earliest(clicker["avCreated"], event)
+                elif event.event == "Session.subscribeCompleted":
+                    clicker["avSubscribeCompleted"] = event
+
+                if event.event == "Session.streamCreated":
+                    clicker["latestOldCreated"] = self.get_latest(clicker["latestOldCreated"], event)
+
+                if event.event == "Session.screen.streamCreated":
+                    clicker["screenCreated"] = self.get_earliest(clicker["screenCreated"], event)
+                elif event.event == "Session.screen.subscribeCompleted":
+                    clicker["screenSubscribeCompleted"] = event
+            else:
+                if event.event == "Session.streamCreated" or \
+                   event.event == "Session.av.streamCreated":
+                    built_in["avCreated"] = self.get_earliest(built_in["avCreated"], event)
+                elif event.event == "Session.subscribeCompleted":
+                    built_in["avSubscribeCompleted"] = event
+
+        # For screen sharing, we didn't originally have a separate screenCreated
+        # event. Therefore we just assume that a/v was the first streamCreated, and screen
+        # sharing was the second streamCreated.
+        if not clicker["screenCreated"] and clicker["screenSubscribeCompleted"] and \
+           clicker["latestOldCreated"]:
+            clicker["screenCreated"] = clicker["latestOldCreated"]
+
+        clickerAvTime = self.get_time_delta(clicker["avCreated"], clicker["avSubscribeCompleted"])
+        clickerScreenTime = self.get_time_delta(clicker["screenCreated"], clicker["screenSubscribeCompleted"])
+        builtInAvTime = self.get_time_delta(built_in["avCreated"], built_in["avSubscribeCompleted"])
+
+        return clickerAvTime, clickerScreenTime, builtInAvTime
+
+    def get_exception_time_integer(self):
+        # Find the earliest streamConnected event (we assume that was A/V),
+        # and the time of the subscribeCompleted.
+        earliestClickerConnected = None
+        earliestBuiltInConnected = None
+        earliestExceptionEvent = None
+        for event in self._events:
+            if (event.event == "Session.streamCreated" or
+               event.event == "Session.av.streamCreated"):
+                if event.is_clicker:
+                    earliestClickerConnected = self.get_earliest(earliestClickerConnected, event)
+                else:
+                    earliestBuiltInConnected = self.get_earliest(earliestBuiltInConnected, event)
+            elif event.exception:
+                earliestExceptionEvent = self.get_earliest(earliestExceptionEvent, event)
+
+        if earliestExceptionEvent.is_clicker:
+            earliestConnected = earliestClickerConnected
+        else:
+            earliestConnected = earliestBuiltInConnected
+
+        if not earliestConnected or not earliestExceptionEvent:
+            return 0
+
+        # This caters for the case where exceptions occur before the connection has
+        # actually started.
+        if earliestExceptionEvent.timestamp < earliestConnected.timestamp:
+            return 0
+
+        return (earliestExceptionEvent.timestamp - earliestConnected.timestamp).seconds
+
     def furthest_state(self):
         """Return the closest state to sendrecv reached in me.
 
@@ -60,24 +188,71 @@ class Segment(object):
 
         """
         states = self._clicker_states.copy()
+
+        if self._built_in_addon_version:
+            shortVersion = float(re.sub(r'([0-9]*\.[0-9]*)[a-z]*\..*', r'\1', self._built_in_addon_version))
+            patchVersion = float(re.sub(r'[0-9]*\.[0-9]*\.([0-9]*).*', r'\1', self._built_in_addon_version))
+
         if self._min_firefox_version and self._min_firefox_version >= 40:
             # If a browser < 40 is used at any point, don't expect too much of the
             # data.
             states &= self._built_in_states
+
             if not states:
                 # This happens less than once in 1000 sessions.
                 print 'No common states between built-in and clicker. This may be due to timing slop. Going with max state.'
                 states = self._clicker_states | self._built_in_states
+
         furthest = PROGRESSION_TO_EVENT_CLASS[max(s.progression for s in states)]
 
+        expectedFurthest = SendRecv
+
+        # If this is a built-in add-on, and the version of that add-on is equal
+        # to or greater than 1.4.1, then we expect the furthest state to be
+        # Connected. Otherwise, its SendRecv, as that's the best we know.
+        if self._built_in_addon_version:
+            shortVersion = float(re.sub(r'([0-9]*\.[0-9]*)[a-z]*\..*', r'\1', self._built_in_addon_version))
+            patchVersion = float(re.sub(r'[0-9]*\.[0-9]*\.([0-9]*).*', r'\1', self._built_in_addon_version))
+
+            if (shortVersion == 1.4 and patchVersion >= 1) or \
+               shortVersion > 1.4:
+                expectedFurthest = Connected
+
+        # If the standalone hadn't been deployed for this segment, then it won't
+        # have the Connected flag, so fake it if the built-in has it.
+        if len(self._events) > 0 and \
+           self._events[0].timestamp < LOOP_STANDALONE_CONNECTED_DEPLOYMENT_DATE and \
+           expectedFurthest == Connected:
+            # If the add-on is the latest version, but this is an older standalone, then
+            # we have to compensate for the fact the standalone didn't have the Connected
+            # state.
+            if PROGRESSION_TO_EVENT_CLASS[max(s.progression for s in self._built_in_states)] == Connected and \
+               furthest == SendRecv:
+                furthest = Connected
+
         # If there's no exception, it's a full Success:
-        if furthest is SendRecv and not any(e.exception for e in self):
+        if furthest is expectedFurthest and not any(e.exception for e in self):
             furthest = Success
+
+        if furthest != Success:
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "------------------"
+            print "Expected: %s, Actual Furthest: %s" % (expectedFurthest, furthest)
+            for event in self._events:
+                print event
+
         return furthest
 
     def is_failure(self):
         """Return whether I have failed."""
         return self.furthest_state() is not Success
+
+    def exception(self):
+        """Return the first exception encountered in me."""
+        return next((event.exception for event in self if event.exception is not None), None)
 
 
 class Participant(object):
@@ -109,6 +284,7 @@ class Participant(object):
             self.states_reached = set()
             # Minimum FF version used by built-in client:
             self.min_firefox_version = None  # None or int > 0
+            self.addon_version = None
 
     def do(self, event):
         """Update my state as if I'd just performed an Event."""
@@ -117,6 +293,10 @@ class Participant(object):
         if not event.is_clicker and event.firefox_version:
             self.min_firefox_version = min(event.firefox_version,
                                            self.min_firefox_version or 10000)
+        if not event.is_clicker and event.addon_version:
+            # Simply use the add-on version straight. Ideally, we'd do a min
+            # comparison, but that's a bit harder.
+            self.addon_version = event.addon_version
         if isinstance(event, Leave):
             self._clear_most()
         else:  # Any other kind of event means he's in the room.
