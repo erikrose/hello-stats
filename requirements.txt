@@ -27,4 +27,4 @@ six==1.9.0
 
 # sha256: g0wCoeekicCbmUBFGKhARyZnTHWpijqLxf5XI4v2MQE
 # sha256: JbSn-72REuAZDzH4h3qgUjyuq4YwhyrRu92roBzdZZk
-urllib3==1.10
+urllib3==1.26.5
