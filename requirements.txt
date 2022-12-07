@@ -4,7 +4,7 @@ boto==2.38.0
 
 # sha256: Jo-gDCfedW1xZj3WH3OkqNhydWm7G0dLLOYCBVOCaHI
 # sha256: mXhebPcVzc3lne4FpnbpnwSDWnHnztIByjF0AcMiupY
-certifi==2015.04.28
+certifi==2022.12.7
 
 # sha256: hmHkF0e4hcES2UK1KP7D6W4QNrXGcTqmBfL-JLYYRsI
 # sha256: kMhZbpZK95ApZS0nNEIDVZkGZxRrghHyQPmci0MrC6w
